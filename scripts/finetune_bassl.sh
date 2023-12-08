@@ -2,6 +2,7 @@
 # script for fine-tuning BaSSL
 
 LOAD_FROM=bassl
+# LOAD_FROM=/scratch/sjc-advdev01/ml/c67024/bassl/bassl/pretrain/ckpt/bassl
 WORK_DIR=$(pwd)
 
 # extract shot representation
@@ -13,9 +14,9 @@ sleep 10s
 # finetune the model
 EXPR_NAME=finetune_${LOAD_FROM}
 PYTHONPATH=${WORK_DIR} python3 ${WORK_DIR}/finetune/main.py \
-	config.TRAIN.BATCH_SIZE.effective_batch_size=1024 \
+	config.TRAIN.BATCH_SIZE.effective_batch_size=256 \
 	config.TRAIN.NUM_WORKERS=8 \
 	config.DISTRIBUTED.NUM_NODES=1 \
-	config.DISTRIBUTED.NUM_PROC_PER_NODE=1 \
+	config.DISTRIBUTED.NUM_PROC_PER_NODE=2 \
 	config.EXPR_NAME=${EXPR_NAME} \
 	+config.PRETRAINED_LOAD_FROM=${LOAD_FROM}
