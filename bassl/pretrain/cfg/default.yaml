@@ -107,12 +107,19 @@ config:
             hidden_dim: 2048
             output_dim: 128
     contextual_group_matching:
-      enabled: True
+      enabled: False
     pseudo_boundary_prediction:
       enabled: True
       num_neg_sample: 1
     masked_shot_modeling:
       enabled: True
+    scene_consistency:
+      enabled: True
+      soft_gamma: 0.5
+      multi_positive: True
+      cluster_num: 12
+      dim: 128 # reduced from 2048 to match what we're doing
+      K: 16 # reduced from 65536 to match what we're doing
     sampling_method:
       name: bassl
       params:
