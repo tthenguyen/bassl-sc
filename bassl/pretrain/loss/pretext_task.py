@@ -12,11 +12,14 @@ from tslearn import metrics
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as transforms
+import random
 
 from misc.dist_utils import gather_from_all
 from model.crn.trn import BertMLMHead
 from model.head import MlpHead
-
+from cluster.Group import Cluster_GPU
+from PIL import ImageFilter
 
 class SimclrLoss(nn.Module):
     def __init__(self, cfg, is_bassl):
@@ -137,10 +140,15 @@ class PretextTaskWrapper(SimclrLoss):
         self.use_msm_loss = cfg.LOSS.masked_shot_modeling.get("enabled", False)
         self.use_pp_loss = cfg.LOSS.pseudo_boundary_prediction.get("enabled", False)
         self.use_cgm_loss = cfg.LOSS.contextual_group_matching.get("enabled", False)
+        self.use_sc_loss = cfg.LOSS.scene_consistency.get("enabled", False)
+
+        # we are replacing CGM with SCRL's Scene Consistency
+        assert(self.use_cgm_loss == False)
+        assert(self.use_sc_loss and self.use_msm_loss and self.use_pp_loss)
 
         if self.use_crn:
             # if we use CRN, one of following losses should be used (set to True)
-            assert self.use_msm_loss or self.use_pp_loss or self.use_cgm_loss
+            assert self.use_msm_loss or self.use_pp_loss or self.use_cgm_loss or self.use_sc_loss
             crn_name = cfg.MODEL.contextual_relation_network.name
         else:
             # if we do not use TM, all following losses should not be used (set to False)
@@ -172,6 +180,267 @@ class PretextTaskWrapper(SimclrLoss):
                 "hidden_size"
             ]
             self.head_cgm = nn.Linear(crn_odim * 2, 2)
+
+        # scene consistency loss
+        if self.use_sc_loss:
+            # crn_odim = cfg.MODEL.contextual_relation_network.params[crn_name][
+            #     "hidden_size"
+            # ]
+            # self.head_sc = nn.Linear(crn_odim * 2, 2)
+            self.soft_gamma = cfg.LOSS.scene_consistency.soft_gamma
+            self.multi_positive = cfg.LOSS.scene_consistency.multi_positive
+            self.cluster_num = cfg.LOSS.scene_consistency.cluster_num
+            self.cluster_obj = Cluster_GPU(self.cluster_num)
+            self.dim = cfg.LOSS.scene_consistency.dim
+            self.K = cfg.LOSS.scene_consistency.K
+            self.head_sc = nn.Linear(self.dim * 2, 2)
+
+            # create the queue
+            self.register_buffer("queue", torch.randn(self.dim, self.K))
+            self.queue = nn.functional.normalize(self.queue, dim=0)
+            self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+            # we must augment the img ourselves when computing k embeddings - Tommy
+            # while the data is already augmented, workaround is to augment again
+            # https://github.com/TencentYoutuResearch/SceneSegmentation-SCRL/blob/main/data/movienet_data.py#L97
+            normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                        std=[0.229, 0.224, 0.225])
+            augmentation_color_k = nn.Sequential(#[
+                # transforms.ToPILImage(),
+                # transforms.RandomResizedCrop(224, scale=(0.2, 1.)), # done by Bassl, but we dont want to resize and crop a batched input
+                # transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.5), # done by Bassl with diff params, cannot work with already batched inputs
+                # transforms.RandomGrayscale(p=0.2), # cannot work with already batched inputs
+                # transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5), # done by Bassl, same params
+                transforms.GaussianBlur(5, [.1, 2.]), # done by Bassl, same radius params, kernel size is arbitrary
+                transforms.RandomHorizontalFlip(), # done by BaSSL
+                # transforms.ToTensor(),
+                # normalize # done by Bassl with diff params, we skip re-normalizing since our batched input is no longer 3-dimensional image
+            )#]
+            # self.transform_k = transforms.Compose(augmentation_color_k)
+            self.transform_k = augmentation_color_k
+
+
+    @torch.no_grad()
+    def get_q_and_k_index_cluster(self, embeddings, return_group=False) -> tuple:
+
+        B = embeddings.size(0)
+        target_index = list(range(0, B))
+        q_index = target_index
+        # print(q_index)
+        choice_cluster, choice_points = self.cluster_obj(embeddings)
+        k_index = []
+        # print(choice_cluster)
+        # print(choice_points)
+        for c in choice_cluster: # runs B times
+            # print(choice_points[c])
+            mean_cluster = np.mean(c)
+            mean_points = np.mean(choice_points[int(mean_cluster)])
+            # k_index.append(int(choice_points[c]))
+            k_index.append(int(mean_points))
+        # print(k_index)
+        if return_group:
+            return (q_index, k_index, choice_cluster, choice_points)
+        else:
+            return (q_index, k_index)
+
+    @torch.no_grad()
+    def _batch_shuffle_ddp(self, x):
+        """
+        Batch shuffle, for making use of BatchNorm.
+        *** Only support DistributedDataParallel (DDP) model. ***
+        """
+        # gather from all gpus
+        batch_size_this = x.shape[0]
+        x_gather = concat_all_gather(x)
+        batch_size_all = x_gather.shape[0]
+
+        num_gpus = batch_size_all // batch_size_this
+
+        # random shuffle index
+        idx_shuffle = torch.randperm(batch_size_all).cuda()
+
+        # broadcast to all gpus
+        torch.distributed.broadcast(idx_shuffle, src=0)
+
+        # index for restoring
+        idx_unshuffle = torch.argsort(idx_shuffle)
+
+        # shuffled index for this gpu
+        gpu_idx = torch.distributed.get_rank()
+        idx_this = idx_shuffle.view(num_gpus, -1)[gpu_idx]
+
+        return x_gather[idx_this], idx_unshuffle
+    
+
+    @torch.no_grad()
+    def _batch_unshuffle_ddp(self, x, idx_unshuffle):
+        """
+        Undo batch shuffle.
+        *** Only support DistributedDataParallel (DDP) model. ***
+        """
+        # gather from all gpus
+        batch_size_this = x.shape[0]
+        x_gather = concat_all_gather(x)
+        batch_size_all = x_gather.shape[0]
+
+        num_gpus = batch_size_all // batch_size_this
+
+        # restored index for this gpu
+        gpu_idx = torch.distributed.get_rank()
+        idx_this = idx_unshuffle.view(num_gpus, -1)[gpu_idx]
+
+        return x_gather[idx_this]
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, keys):
+        # print("ptr ", self.queue_ptr)
+        # print("keys ", keys.shape)
+        # not entirely sure how this is supposed to work... but leaving out for now - Tommy
+        # gather keys before updating queue
+        # keys = concat_all_gather(keys)
+
+        batch_size = keys.shape[0]
+
+        ptr = int(self.queue_ptr)
+        
+        # not entirely sure how this is supposed to work... but leaving out for now - Tommy
+        # assert self.K % batch_size == 0  # for simplicity
+
+        # not entirely sure how this is supposed to work... but hacking for now - Tommy
+        # replace the keys at ptr (dequeue and enqueue)
+        # self.queue[:, ptr:ptr + batch_size] = keys.T
+        # print("queue ", self.queue.shape)
+        # print("keys ", keys.shape)
+        self.queue[:, :self.K] = keys.T
+
+        ptr = (ptr + batch_size) % self.K  # move pointer
+
+        self.queue_ptr[0] = ptr
+
+    # def _compute_sc_loss(self, crn, dense_shot_repr):
+    def _compute_sc_loss(self, dense_shot_repr, crn=None, enc=None):
+        """taken from SCRL Github file SCRL_MoCo.py"""
+        # compute query features
+        # we use CRN instead of separate encoder for query - Tommy
+        # embeddings = self.encoder_q(img_q, self.mlp)
+        # print("dense shot repr ", dense_shot_repr.shape)
+        if crn:
+            embeddings, _ = crn(dense_shot_repr)  # infer CRN without masking
+            embeddings = embeddings[:, 1:].contiguous()  # exclude [CLS] token
+        if enc:
+            embeddings = enc(dense_shot_repr)
+        # print(embeddings.shape)
+
+        B, nshot, _ = embeddings.shape
+        # print("nshot ", nshot)
+        embeddings = F.normalize(embeddings, dim=1) # may or may not be necessary - Tommy
+
+        # get q and k index
+        index_q, index_k = self.get_q_and_k_index_cluster(embeddings)
+        
+        # features of q
+        q = embeddings[index_q]
+
+        # compute key features
+        with torch.no_grad():  
+            # we don't need to do this for BaSSL as we are not using contrastive loss in this pretext - Tommy
+            # update the key encoder
+            # self._momentum_update_key_encoder()
+
+            # we augment the query image again, to obtain k embeddings
+            # augmented_shot = torch.stack(self.transform_k(dense_shot_repr), dim=0)
+            augmented_shot = self.transform_k(dense_shot_repr).cuda()
+            # print("augmented shot ", augmented_shot.shape)
+
+            # shuffle for making use of BN
+            augmented_shot, idx_unshuffle = self._batch_shuffle_ddp(augmented_shot)
+
+            # k = self.encoder_k(img_k, self.mlp)   # img_k is an augmented version of img_q - Tommy
+            # we encode the augmented img
+            if crn:
+                k, _ = crn(augmented_shot)
+                k = k[:, 1:].contiguous()  # exclude [CLS] token
+            if enc:
+                k = enc(augmented_shot)
+
+            k = F.normalize(k, dim=1)
+
+            # undo shuffle
+            k = self._batch_unshuffle_ddp(k, idx_unshuffle)
+
+        k_ori = k # self-augmented selection (img_k is an augmented version of img_q) - Tommy
+        k = k[index_k] # scene consistency selection, using index_k to find cluster mean - Tommy
+
+        if self.multi_positive:
+            # SCRL Soft-SC positive sample selection - Tommy
+            k = (k + k_ori) * self.soft_gamma
+
+        # negative shot selection from SCRL
+        neg_shot_repr = self.queue.clone().detach()
+        # print("neg shot repr ", neg_shot_repr.shape)
+        # print("q ", q.shape)
+        # print("k ", k.shape)
+        
+        # pick a random shot to calculate loss over - Tommy
+        group_idx = np.arange(0, nshot)
+        sampled_idx = np.random.choice(group_idx, size=1)[0]
+
+        q = q[:, sampled_idx].contiguous()
+        k = k[:, sampled_idx].contiguous()
+        # print("neg shot repr ", neg_shot_repr.shape)
+        # print("q ", q.shape)
+        # print("k ", k.shape)
+
+
+        # From this point on, we refer back to BaSSL's CGM logit calculation for CGM cross-entropy loss - Tommy
+        logits = self.head_sc(
+            torch.cat(
+                [
+                    torch.cat([q, k], dim=1),
+                    torch.cat([q, neg_shot_repr.T], dim=1),
+                ],
+                dim=0,
+            )
+        )  # [2*B 2]
+        assert(logits.shape[0] == 2 * B)
+        labels = torch.cat(
+            [
+                torch.ones(B, dtype=torch.long, device=embeddings.device),
+                torch.zeros(B, dtype=torch.long, device=embeddings.device),
+            ],
+            dim=0,
+        )  # [2*B]
+        assert(labels.shape[0] == 2 * B)
+
+        ### SCRL Logit and Label computation ###
+        # # compute logits
+        # # positive logits: Nx1
+        # l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
+
+        # # negative logits: NxK
+        # l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
+
+        # # logits: Nx(1+K)
+        # logits = torch.cat([l_pos, l_neg], dim=1)
+
+        # # apply temperature
+        # logits /= self.T
+
+        # # labels: positive key indicators
+        # labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
+
+        # # dequeue and enqueue
+        # self._dequeue_and_enqueue(k)
+
+        # return logits, labels
+
+        # dequeue and enqueue
+        self._dequeue_and_enqueue(k)
+
+        # we use same cross-entropy loss fxn as CGM for control, only changing the shot selection method - Tommy
+        scm_loss = F.cross_entropy(logits, labels) 
+
+        return scm_loss
 
     @torch.no_grad()
     def _compute_dtw_path(self, s_emb, d_emb):
@@ -321,3 +590,17 @@ class PretextTaskWrapper(SimclrLoss):
         cgm_loss = F.cross_entropy(logit, label)
 
         return cgm_loss
+
+# utils for Scene Consistency loss - Tommy
+@torch.no_grad()
+def concat_all_gather(tensor):
+    """
+    Performs all_gather operation on the provided tensors.
+    *** Warning ***: torch.distributed.all_gather has no gradient.
+    """
+    tensors_gather = [torch.ones_like(tensor)
+        for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
+
+    output = torch.cat(tensors_gather, dim=0)
+    return output

@@ -82,6 +82,8 @@ class BaSSLLoss(PretextTaskWrapper):
         # head_shot_repr: [b n_sparse+n_dense d] -> [b n_sparse d], [b n_dense d]
         head_shot_repr = self.head_nce(shot_repr)
         s_emb, d_emb = torch.split(head_shot_repr, [n_sparse, n_dense], dim=1)
+        # print("s_emb ", s_emb.shape)
+        # print("d_emb ", d_emb.shape)
 
         # compute alignment between sparse and dense sequences using DTW
         dtw_path = self._compute_dtw_path(s_emb, d_emb)
@@ -107,7 +109,7 @@ class BaSSLLoss(PretextTaskWrapper):
             ssm_loss = self._compute_ssm_loss(s_emb, d_emb, dtw_path)
             loss["ssm_loss"] = ssm_loss
 
-        if self.use_pp_loss or self.use_cgm_loss:
+        if self.use_pp_loss or self.use_cgm_loss:# or self.use_sc_loss: # SC for Scene Consistency from SCRL
             crn_repr_wo_mask, _ = crn(dense_shot_repr)  # infer CRN without masking
             crn_repr_wo_mask = crn_repr_wo_mask[
                 :, 1:
@@ -126,11 +128,18 @@ class BaSSLLoss(PretextTaskWrapper):
             cgm_loss = self._compute_cgm_loss(crn_repr_wo_mask, dtw_path, bd_idx)
             loss["cgm_loss"] = cgm_loss
 
+        # compute scene consistency loss
+        if self.use_sc_loss:
+            # sc_loss = self._compute_sc_loss(crn, dense_shot_repr)
+            sc_loss = self._compute_sc_loss(dense_shot_repr, None, self.head_nce)
+            loss["sc_loss"] = sc_loss
+
         return loss
 
 
 class BaSSLShotcolSimclrLoss(PretextTaskWrapper):
     def __init__(self, cfg):
+        assert(False) # this model shouldn't be called
         PretextTaskWrapper.__init__(self, cfg=cfg)
 
         # to disable debug dump in numba (used by DTW computation)
@@ -192,7 +201,7 @@ class BaSSLShotcolSimclrLoss(PretextTaskWrapper):
             ssm_loss = self._compute_ssm_loss(s_emb, d_emb, dtw_path)
             loss["ssm_loss"] = ssm_loss
 
-        if self.use_pp_loss or self.use_cgm_loss:
+        if self.use_pp_loss or self.use_cgm_loss: # or self.use_sc_loss: # SC for Scene Consistency from SCRL
             crn_repr_wo_mask, _ = crn(dense_shot_repr)  # infer CRN without masking
             crn_repr_wo_mask = crn_repr_wo_mask[
                 :, 1:
