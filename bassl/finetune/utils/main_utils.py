@@ -98,6 +98,7 @@ def init_model(cfg):
             crn=crn,
             checkpoint_path=os.path.join(
                 cfg.PRETRAINED_CKPT_PATH, cfg.PRETRAINED_LOAD_FROM, "model-v1.ckpt"
+#                cfg.PRETRAINED_CKPT_PATH, cfg.PRETRAINED_LOAD_FROM, "model-v3.ckpt"
             ),
             strict=False,
         )
