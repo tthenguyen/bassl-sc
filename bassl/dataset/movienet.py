@@ -38,11 +38,13 @@ class MovieNetDataset(BaseDataset):
             if self.is_train:
                 with open(
                     os.path.join(self.cfg.ANNO_PATH, "anno.pretrain.ndjson"), "r"
+#                    os.path.join(self.cfg.ANNO_PATH, "anno.pretrain.small.ndjson"), "r"
                 ) as f:
                     self.anno_data = ndjson.load(f)
             else:
                 with open(
                     os.path.join(self.cfg.ANNO_PATH, "anno.test.ndjson"), "r"
+#                    os.path.join(self.cfg.ANNO_PATH, "anno.test.small.ndjson"), "r"
                 ) as f:
                     self.anno_data = ndjson.load(f)
 
